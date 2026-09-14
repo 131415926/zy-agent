@@ -37,10 +37,21 @@ class AgentClient:
     # ---- 聊天 ----
 
     def chat(self, session_id: Optional[str], message: str) -> dict:
-        """同步聊天：返回 {"session_id", "reply", "tool_calls"}。"""
+        """同步聊天：返回 {"session_id", "reply", "tool_calls", "pending_approval"?}。
+
+        pending_approval 非空时表示有操作等待审批，用 approve()/reject() 处理。
+        """
         resp = self._http.post(
             f"{self.base_url}/chat",
             json={"session_id": session_id, "message": message},
+        )
+        return self._check(resp).json()
+
+    def approve(self, session_id: str, decision: str = "approve") -> dict:
+        """审批待确认的操作：decision = approve | reject。返回结构与 chat 相同。"""
+        resp = self._http.post(
+            f"{self.base_url}/approvals",
+            json={"session_id": session_id, "decision": decision},
         )
         return self._check(resp).json()
 

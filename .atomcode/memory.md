@@ -1,0 +1,1 @@
+- 项目目标：agent-app 要对标 codex/qwen-code/Claude Code 级别的完整 Agent（非 demo），用户要求边学 LangChain/LangGraph 边把功能做全：RAG、多Agent、MCP、可观测性、审批、上下文管理等。

@@ -1,11 +1,17 @@
-"""LangGraph Agent 定义：create_agent + 工具 + checkpointer（多轮会话记忆）。"""
+"""LangGraph Agent 定义：create_agent + 真实工具集 + checkpointer + 审批门控。
+
+审批机制（human-in-the-loop）：write_file / run_cmd 等敏感工具执行前调用
+langgraph 的 interrupt() 暂停图，等待 /approvals 接口 resume（见 main.py）。
+"""
 import os
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
+
+from .tools_system import SYSTEM_TOOLS, sandbox_banner
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
@@ -40,12 +46,41 @@ def get_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-TOOLS = [add, multiply, get_weather, get_time]
+# 审批包装：敏感工具执行前 interrupt 暂停，等待人工确认后 resume
+from langgraph.types import interrupt  # noqa: E402
 
-SYSTEM_PROMPT = (
-    "你是一个乐于助人的中文助手。涉及计算必须使用工具；"
-    "被问到天气、时间等信息时使用对应工具查询。回答保持简洁。"
-)
+
+def _with_approval(t: BaseTool) -> BaseTool:
+    @tool(t.name, description=t.description, args_schema=t.args_schema)
+    def guarded(**kwargs):
+        decision = interrupt({
+            "type": "approval",
+            "tool": t.name,
+            "args": kwargs,
+            "question": f"是否允许执行 {t.name}？",
+        })
+        if decision != "approve":
+            return f"[已拒绝] 用户未批准 {t.name} 调用（args={kwargs}）。请勿再尝试该操作，改为询问用户。"
+        return t.invoke(kwargs)
+
+    return guarded
+
+
+SENSITIVE = {"run_cmd", "write_file"}
+TOOLS = [(_with_approval(t) if t.name in SENSITIVE else t) for t in SYSTEM_TOOLS] + [get_time]
+
+SYSTEM_PROMPT = f"""你是 zy-agent——一个运行在用户终端里的编程助手（对标 codex / claude code），通过工具帮用户完成真实任务。
+
+工作目录沙箱：{sandbox_banner()}
+所有文件路径一律使用相对该目录的路径。
+
+核心准则：
+1. 动手前先看：修改/执行前先用 list_dir / read_file / glob_files / grep_files 了解现状，不要凭空猜测文件内容。
+2. 计划先行：接到非平凡任务，先用一两句话说明你的步骤，然后逐步执行，每步汇报结果。
+3. 最小改动：只做用户要求的事，不顺手重构、不添加未经要求的功能。
+4. 敏感操作（写文件、执行命令）会弹出审批，被拒绝时立即停止该操作并询问用户，不要绕过。
+5. 如实汇报：命令失败就读错误、修根因，不假装成功；不确定就说不确定。
+6. 回答用中文，保持简洁；代码/文件内容保持原格式。"""
 
 
 def _build_model():

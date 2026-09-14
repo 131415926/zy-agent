@@ -12,11 +12,12 @@ from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from langgraph.types import Command
 from pydantic import BaseModel
 
 from .agent import get_agent
 
-app = FastAPI(title="LangGraph Agent Server", version="1.0.0")
+app = FastAPI(title="LangGraph Agent Server", version="1.1.0")
 
 # 活跃会话登记（thread_id -> 最近活跃时间戳）
 _sessions: dict[str, float] = {}
@@ -27,14 +28,39 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class Approval(BaseModel):
+    tool: str
+    args: dict
+    question: str
+
+
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
     tool_calls: list[dict]
+    pending_approval: Optional[Approval] = None  # 非空 = 图已暂停等审批
+
+
+class ApprovalRequest(BaseModel):
+    session_id: str
+    decision: str  # approve | reject
 
 
 def _cfg(session_id: str) -> dict:
     return {"configurable": {"thread_id": session_id}}
+
+
+def _pending_approval(session_id: str) -> Optional[Approval]:
+    """检查该会话图是否因 interrupt 暂停（等待审批）。"""
+    agent = get_agent()
+    state = agent.get_state(_cfg(session_id))
+    if not state.next:
+        return None
+    for task in state.tasks:
+        if task.interrupts:
+            payload = task.interrupts[0].value
+            return Approval(tool=payload["tool"], args=payload["args"], question=payload["question"])
+    return None
 
 
 def _extract(result: dict, session_id: str) -> ChatResponse:
@@ -66,7 +92,25 @@ def chat(req: ChatRequest) -> ChatResponse:
         _cfg(session_id),
     )
     _sessions[session_id] = time.time()
-    return _extract(result, session_id)
+    resp = _extract(result, session_id)
+    resp.pending_approval = _pending_approval(session_id)
+    return resp
+
+
+@app.post("/approvals", response_model=ChatResponse)
+def approvals(req: ApprovalRequest) -> ChatResponse:
+    """审批接口：approve/reject 后恢复被 interrupt 暂停的图执行。"""
+    if req.decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision 只能为 approve 或 reject")
+    agent = get_agent()
+    cfg = _cfg(req.session_id)
+    if _pending_approval(req.session_id) is None:
+        raise HTTPException(404, "该会话没有待审批的操作")
+    result = agent.invoke(Command(resume=req.decision), cfg)
+    _sessions[req.session_id] = time.time()
+    resp = _extract(result, req.session_id)
+    resp.pending_approval = _pending_approval(req.session_id)  # 可能还有下一个待审批
+    return resp
 
 
 @app.post("/chat/stream")
@@ -100,6 +144,10 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                             yield await sse("tool", f"{t['name']}({t['args']})")
                     if chunk.content:
                         yield await sse("message", chunk.content)
+            # 图结束后检查是否有待审批操作（interrupt 发生在工具节点内）
+            pa = _pending_approval(session_id)
+            if pa:
+                yield await sse("approval", json.dumps(pa.model_dump(), ensure_ascii=False))
             yield await sse("done", session_id)
         except Exception as e:  # noqa: BLE001 —— 统一转成 error 事件下发
             yield await sse("error", str(e))

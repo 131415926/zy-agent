@@ -43,26 +43,54 @@ def chat(
     def ask(text: str) -> None:
         nonlocal sid
         console.print()
-        with console.status("[dim]思考中…[/dim]", spinner="dots"):
-            chunks, tools = [], []
-            try:
-                for event, data in client.chat_stream(sid, text):
-                    if event == "message":
-                        chunks.append(data)
-                    elif event == "tool":
-                        tools.append(data)
-                    elif event == "done":
-                        sid = data
-                    elif event == "error":
-                        console.print(f"[red]服务端错误：{data}[/red]")
-                        return
-            except AgentError as e:
-                console.print(f"[red]请求失败：{e}[/red]")
-                return
+        chunks, tools = [], []
+        try:
+            for event, data in client.chat_stream(sid, text):
+                if event == "message":
+                    chunks.append(data)
+                    print(data, end="", flush=True)
+                elif event == "tool":
+                    tools.append(data)
+                elif event == "approval":
+                    handle_approval(data)
+                elif event == "done":
+                    sid = data
+                elif event == "error":
+                    console.print(f"\n[red]服务端错误：{data}[/red]")
+                    return
+            print()
+        except AgentError as e:
+            console.print(f"[red]请求失败：{e}[/red]")
+            return
         if tools:
             console.print(f"[cyan]🔧 工具调用：{'; '.join(tools)}[/cyan]")
-        reply = "".join(chunks)
-        console.print(Panel(Markdown(reply), title=f"assistant · {sid}", border_style="green"))
+
+    def handle_approval(payload_json: str) -> None:
+        """流式中收到审批请求：展示详情并在终端内 y/n 确认。"""
+        import json as _json
+
+        nonlocal sid
+        pa = _json.loads(payload_json)
+        console.print(f"[yellow]⛔ 需要审批：{pa['tool']}[/yellow]")
+        console.print(Panel(_json.dumps(pa["args"], ensure_ascii=False, indent=2),
+                            title=pa.get("question", "操作详情"), border_style="yellow"))
+        ans = console.input("[yellow]批准执行? [y=允许 / n=拒绝] [/yellow]").strip().lower()
+        decision = "approve" if ans in ("y", "yes") else "reject"
+        # 审批走同步接口（resume 后继续跑完本轮）
+        result = client.approve(sid, decision)
+        sid = result.get("session_id", sid)
+        reply = result.get("reply", "")
+        if reply:
+            console.print(Panel(Markdown(reply), title=f"assistant · {sid}", border_style="green"))
+        # 拒绝后模型可能给出新的说明，或又产生下一个待审批
+        while result.get("pending_approval"):
+            pa2 = result["pending_approval"]
+            console.print(f"[yellow]⛔ 又一个待审批：{pa2['tool']} {pa2['args']}[/yellow]")
+            ans2 = console.input("[yellow]批准执行? [y/n] [/yellow]").strip().lower()
+            result = client.approve(sid, "approve" if ans2 in ("y", "yes") else "reject")
+            sid = result.get("session_id", sid)
+            if result.get("reply"):
+                console.print(Panel(Markdown(result["reply"]), title=f"assistant · {sid}", border_style="green"))
 
     if once is not None:
         ask(once)
