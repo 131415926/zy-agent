@@ -8,6 +8,7 @@ import json
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -15,9 +16,17 @@ from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 
-from .agent import get_agent
+from .agent import get_agent, init_agent
 
-app = FastAPI(title="LangGraph Agent Server", version="1.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """启动时初始化 AsyncSqliteSaver 连接与 Agent 图。"""
+    await init_agent()
+    yield
+
+
+app = FastAPI(title="LangGraph Agent Server", version="1.2.0", lifespan=lifespan)
 
 # 活跃会话登记（thread_id -> 最近活跃时间戳）
 _sessions: dict[str, float] = {}
@@ -50,10 +59,10 @@ def _cfg(session_id: str) -> dict:
     return {"configurable": {"thread_id": session_id}}
 
 
-def _pending_approval(session_id: str) -> Optional[Approval]:
+async def _pending_approval(session_id: str) -> Optional[Approval]:
     """检查该会话图是否因 interrupt 暂停（等待审批）。"""
     agent = get_agent()
-    state = agent.get_state(_cfg(session_id))
+    state = await agent.aget_state(_cfg(session_id))
     if not state.next:
         return None
     for task in state.tasks:
@@ -81,35 +90,35 @@ def health() -> dict:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest) -> ChatResponse:
     """同步聊天：一次返回完整回复。"""
     if not req.message.strip():
         raise HTTPException(400, "message 不能为空")
     session_id = req.session_id or uuid.uuid4().hex[:8]
     agent = get_agent()
-    result = agent.invoke(
+    result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": req.message}]},
         _cfg(session_id),
     )
     _sessions[session_id] = time.time()
     resp = _extract(result, session_id)
-    resp.pending_approval = _pending_approval(session_id)
+    resp.pending_approval = await _pending_approval(session_id)
     return resp
 
 
 @app.post("/approvals", response_model=ChatResponse)
-def approvals(req: ApprovalRequest) -> ChatResponse:
+async def approvals(req: ApprovalRequest) -> ChatResponse:
     """审批接口：approve/reject 后恢复被 interrupt 暂停的图执行。"""
     if req.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision 只能为 approve 或 reject")
     agent = get_agent()
     cfg = _cfg(req.session_id)
-    if _pending_approval(req.session_id) is None:
+    if await _pending_approval(req.session_id) is None:
         raise HTTPException(404, "该会话没有待审批的操作")
-    result = agent.invoke(Command(resume=req.decision), cfg)
+    result = await agent.ainvoke(Command(resume=req.decision), cfg)
     _sessions[req.session_id] = time.time()
     resp = _extract(result, req.session_id)
-    resp.pending_approval = _pending_approval(req.session_id)  # 可能还有下一个待审批
+    resp.pending_approval = await _pending_approval(req.session_id)  # 可能还有下一个待审批
     return resp
 
 
@@ -145,7 +154,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     if chunk.content:
                         yield await sse("message", chunk.content)
             # 图结束后检查是否有待审批操作（interrupt 发生在工具节点内）
-            pa = _pending_approval(session_id)
+            pa = await _pending_approval(session_id)
             if pa:
                 yield await sse("approval", json.dumps(pa.model_dump(), ensure_ascii=False))
             yield await sse("done", session_id)
@@ -161,12 +170,12 @@ def sessions() -> dict:
 
 
 @app.get("/sessions/{session_id}/history")
-def session_history(session_id: str, limit: int = 20) -> dict:
+async def session_history(session_id: str, limit: int = 20) -> dict:
     """查询某会话的消息历史（来自 checkpointer 持久化的图状态）。"""
     if session_id not in _sessions:
         raise HTTPException(404, "会话不存在")
     agent = get_agent()
-    state = agent.get_state(_cfg(session_id))
+    state = await agent.aget_state(_cfg(session_id))
     msgs = state.values.get("messages", [])[-limit * 2:]  # 一轮≈2条，粗略截取
     history = []
     for m in msgs:

@@ -46,6 +46,15 @@ def get_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+@tool
+def search_docs(query: str) -> str:
+    """检索本地知识库（项目文档），返回最相关的片段及来源。回答项目结构、
+    学习文档内容、项目约定等问题前，先用此工具检索。"""
+    from .rag import search_docs as _search
+
+    return _search(query)
+
+
 # 审批包装：敏感工具执行前 interrupt 暂停，等待人工确认后 resume
 from langgraph.types import interrupt  # noqa: E402
 
@@ -67,7 +76,7 @@ def _with_approval(t: BaseTool) -> BaseTool:
 
 
 SENSITIVE = {"run_cmd", "write_file"}
-TOOLS = [(_with_approval(t) if t.name in SENSITIVE else t) for t in SYSTEM_TOOLS] + [get_time]
+TOOLS = [(_with_approval(t) if t.name in SENSITIVE else t) for t in SYSTEM_TOOLS] + [get_time, search_docs]
 
 SYSTEM_PROMPT = f"""你是 zy-agent——一个运行在用户终端里的编程助手（对标 codex / claude code），通过工具帮用户完成真实任务。
 
@@ -117,13 +126,27 @@ class _EchoModel:
         yield self._echo(messages)
 
 
-# 进程级单例：agent 与 checkpointer（生产环境可换 SqliteSaver/RedisSaver）
-checkpointer = InMemorySaver()
+# 进程级单例：agent 与 checkpointer
+# 会话持久化：AsyncSqliteSaver 落盘到 data/checkpoints.db（同时支持同步/异步图调用）。
+# 服务端已全链路使用 async 接口（ainvoke/astream/aget_state），同步方法仅在
+# 非事件循环线程可用，因此统一走 a* 方法，避免 InvalidStateError。
+import aiosqlite  # noqa: E402
+
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: E402
+
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+_DB_PATH = os.path.abspath(os.path.join(_DATA_DIR, "checkpoints.db"))
+
+checkpointer: AsyncSqliteSaver | None = None
 
 
-def get_agent() -> CompiledStateGraph:
-    """构建（或复用）Agent 图。"""
-    global _agent
+async def init_agent() -> CompiledStateGraph:
+    """FastAPI lifespan 启动时调用：建立 aiosqlite 连接并构建 Agent 图。"""
+    global checkpointer, _agent
+    if checkpointer is None:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        _conn = await aiosqlite.connect(_DB_PATH)
+        checkpointer = AsyncSqliteSaver(_conn)
     if "_agent" not in globals():
         _agent = create_agent(
             model=_build_model(),
@@ -132,3 +155,10 @@ def get_agent() -> CompiledStateGraph:
             checkpointer=checkpointer,
         )
     return _agent
+
+
+def get_agent() -> CompiledStateGraph:
+    """取已初始化的 Agent 图（必须在 FastAPI startup 之后调用）。"""
+    if "_agent" not in globals():
+        raise RuntimeError("agent 未初始化：FastAPI lifespan 未执行 init_agent()")
+    return _agent  # type: ignore[name-defined]
