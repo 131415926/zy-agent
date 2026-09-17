@@ -17,6 +17,7 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from .agent import get_agent, init_agent
+from .tracing import get_traces, start_run, summarize
 
 
 @asynccontextmanager
@@ -96,6 +97,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(400, "message 不能为空")
     session_id = req.session_id or uuid.uuid4().hex[:8]
     agent = get_agent()
+    run = start_run(session_id, req.message)
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": req.message}]},
         _cfg(session_id),
@@ -103,6 +105,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     _sessions[session_id] = time.time()
     resp = _extract(result, session_id)
     resp.pending_approval = await _pending_approval(session_id)
+    run.finish(resp.reply)
     return resp
 
 
@@ -132,6 +135,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     async def event_gen() -> AsyncIterator[str]:
         _sessions[session_id] = time.time()
+        run = start_run(session_id, req.message)
+        chunks: list[str] = []
 
         async def sse(event: str, data: str) -> str:
             return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -139,28 +144,60 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         try:
             # 先告知 session_id：客户端在首个审批到来前就能拿到 sid
             yield await sse("start", session_id)
-            # compiled graph 原生支持 astream（sync 节点会自动在线程池执行）
-            async for chunk in agent.astream(
+            # 双模式流：messages（token 级）+ updates（节点级，用于捕获 plan 产出）
+            stream = agent.astream(
                 {"messages": [{"role": "user", "content": req.message}]},
                 _cfg(session_id),
-                stream_mode="messages",
-            ):
-                # stream_mode="messages" 产出 (message_chunk, metadata) 元组
-                if isinstance(chunk, tuple):
-                    chunk = chunk[0]
-                kind = type(chunk).__name__
-                if kind in ("AIMessageChunk", "AIMessage"):
-                    if getattr(chunk, "tool_calls", None):
-                        for t in chunk.tool_calls:
-                            yield await sse("tool", f"{t['name']}({t['args']})")
-                    if chunk.content:
-                        yield await sse("message", chunk.content)
+                stream_mode=["messages", "updates"],
+                subgraphs=True,  # 透出 executor 子图内部的 token 流
+            )
+            async for chunk in stream:
+                # subgraphs=True + 多模式时为三元组：(namespace, 模式名, 载荷)
+                namespace = None
+                if isinstance(chunk, tuple) and len(chunk) == 3 and isinstance(chunk[0], tuple):
+                    namespace, chunk = chunk[0], chunk[1:]
+                # 无子图时为二元组：(模式名, 载荷)
+                if not (isinstance(chunk, tuple) and len(chunk) == 2):
+                    continue
+                mode, payload = chunk
+                if mode == "updates":
+                    if isinstance(payload, dict):
+                        for node, delta in payload.items():
+                            if node == "plan" and isinstance(delta, dict) and delta.get("plan"):
+                                yield await sse("plan", json.dumps(delta["plan"], ensure_ascii=False))
+                    continue
+                if mode == "messages":
+                    msg_chunk = payload[0] if isinstance(payload, tuple) else payload
+                    meta = payload[1] if isinstance(payload, tuple) and len(payload) > 1 else {}
+                    # 排除外层图 plan/reflect 节点的内部 LLM 输出（executor 子图内
+                    # langgraph_node 为 model/tools 等，不在排除之列）
+                    node_name = str(meta.get("langgraph_node", "")) if isinstance(meta, dict) else ""
+                    if node_name in ("plan", "reflect"):
+                        continue
+                    kind = type(msg_chunk).__name__
+                    if kind in ("AIMessageChunk", "AIMessage"):
+                        # trace：token 用量（chunk 级 usage 汇总）
+                        if getattr(msg_chunk, "usage_metadata", None):
+                            run.add_usage(msg_chunk.usage_metadata)
+                        if getattr(msg_chunk, "tool_calls", None):
+                            for t in msg_chunk.tool_calls:
+                                run.event("tool", t["name"], json.dumps(t["args"], ensure_ascii=False))
+                                yield await sse("tool", f"{t['name']}({t['args']})")
+                        if msg_chunk.content:
+                            if not chunks:
+                                run.event("llm", node_name or "model", "first token")
+                            chunks.append(msg_chunk.content)
+                            yield await sse("message", msg_chunk.content)
             # 图结束后检查是否有待审批操作（interrupt 发生在工具节点内）
             pa = await _pending_approval(session_id)
             if pa:
+                run.event("approval", pa.tool, json.dumps(pa.args, ensure_ascii=False))
                 yield await sse("approval", json.dumps(pa.model_dump(), ensure_ascii=False))
+            run.finish("".join(chunks))
             yield await sse("done", session_id)
         except Exception as e:  # noqa: BLE001 —— 统一转成 error 事件下发
+            run.event("error", detail=str(e))
+            run.finish("".join(chunks))
             yield await sse("error", str(e))
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
@@ -169,6 +206,18 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 @app.get("/sessions")
 def sessions() -> dict:
     return {"sessions": sorted(_sessions, key=_sessions.get, reverse=True)}  # type: ignore[arg-type]
+
+
+@app.get("/traces/{session_id}")
+async def traces(session_id: str, limit: int = 5) -> dict:
+    """会话执行 trace：每次请求的耗时/token/事件序列（最近 limit 个 run）。"""
+    return {"session_id": session_id, "runs": get_traces(session_id, limit=limit)}
+
+
+@app.get("/traces/{session_id}/summary")
+async def traces_summary(session_id: str) -> dict:
+    """会话级汇总：请求数/总耗时/总 token/事件分布。"""
+    return summarize(session_id)
 
 
 @app.get("/sessions/{session_id}/history")

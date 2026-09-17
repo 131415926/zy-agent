@@ -20,6 +20,19 @@ app = typer.Typer(help="LangGraph Agent CLI 客户端")
 console = Console()
 
 
+def _render_plan(payload_json: str) -> None:
+    """渲染服务端下发的计划清单（JSON 数组 [{step, status}]）。"""
+    import json as _json
+
+    steps = _json.loads(payload_json)
+    lines = []
+    for i, s in enumerate(steps, 1):
+        mark = {"done": "[green]✓[/green]", "failed": "[red]✗[/red]", "pending": "[dim]○[/dim]"}.get(
+            s.get("status", "pending"), "[dim]○[/dim]")
+        lines.append(f"{mark} {i}. {s['step']}")
+    console.print(Panel("\n".join(lines), title="📋 执行计划", border_style="blue"))
+
+
 def _client(server: str) -> AgentClient:
     try:
         c = AgentClient(server)
@@ -49,6 +62,8 @@ def chat(
             for event, data in client.chat_stream(sid, text):
                 if event == "start":
                     sid = data  # 流一开始就拿到会话 id，审批时不再为空
+                elif event == "plan":
+                    _render_plan(data)
                 elif event == "message":
                     if not chunks:
                         console.print("[dim]✓ 模型开始回复[/dim]")
@@ -136,6 +151,47 @@ def sessions(server: str = typer.Option("http://127.0.0.1:8000", help="服务端
         return
     for i, s in enumerate(ss, 1):
         console.print(f"{i}. {s}")
+
+
+@app.command()
+def logs(
+    session_id: str = typer.Argument(..., help="会话 ID"),
+    server: str = typer.Option("http://127.0.0.1:8000", help="服务端地址"),
+    limit: int = typer.Option(5, "--limit", "-l", help="最近几次请求"),
+):
+    """查看会话执行 trace：耗时 / token / 事件序列。"""
+    client = _client(server)
+    data = client.traces(session_id, limit=limit)
+    runs = data.get("runs", [])
+    if not runs:
+        console.print("[dim]该会话暂无 trace 记录（trace 为进程内存态，服务重启后清空）[/dim]")
+        return
+    for r in runs:
+        u = r.get("usage", {})
+        tok = f"{u.get('prompt_tokens', 0)}+{u.get('completion_tokens', 0)}tok"
+        tok += " (估算)" if u.get("estimated") else ""
+        console.print(Panel(
+            f"[bold]{r['message']}[/bold]\n"
+            f"[dim]耗时 {r['total_ms']}ms · token {tok}[/dim]\n" +
+            "\n".join(f"  {e['t']:>6}s {e['type']:<8} {e.get('name','')} {e.get('detail','')[:60]}"
+                      for e in r.get("events", [])),
+            title=f"run @ {r['start']:.0f}", border_style="magenta"))
+
+
+@app.command()
+def stats(
+    session_id: str = typer.Argument(..., help="会话 ID"),
+    server: str = typer.Option("http://127.0.0.1:8000", help="服务端地址"),
+):
+    """会话级汇总：请求数 / 总耗时 / 总 token / 事件分布。"""
+    client = _client(server)
+    s = client.traces_summary(session_id)
+    console.print(Panel(
+        f"请求数: {s.get('runs', 0)}\n"
+        f"总耗时: {s.get('total_ms', 0)}ms\n"
+        f"token: {s.get('prompt_tokens', 0)}+{s.get('completion_tokens', 0)}\n"
+        f"事件分布: {s.get('events', {})}",
+        title=f"📊 {session_id} 汇总", border_style="magenta"))
 
 
 if __name__ == "__main__":

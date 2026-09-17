@@ -7,8 +7,11 @@ import os
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain_core.messages import SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from .tools_system import SYSTEM_TOOLS, sandbox_banner
@@ -173,20 +176,113 @@ checkpointer: AsyncSqliteSaver | None = None
 
 
 async def init_agent() -> CompiledStateGraph:
-    """FastAPI lifespan 启动时调用：建立 aiosqlite 连接并构建 Agent 图。"""
+    """FastAPI lifespan 启动时调用：建立 aiosqlite 连接并构建 Agent 图。
+
+    图结构（plan-and-execute，对标 codex 的先规划后执行）：
+        START -> plan -> executor(create_agent 子图，一次执行一步) -> reflect --\
+                          ^                                                       \
+                          |_______________________________/  (还有待办步骤)
+                                                                          -> END (全部完成)
+    """
     global checkpointer, _agent
     if checkpointer is None:
         os.makedirs(_DATA_DIR, exist_ok=True)
         _conn = await aiosqlite.connect(_DB_PATH)
         checkpointer = AsyncSqliteSaver(_conn)
     if "_agent" not in globals():
-        _agent = create_agent(
+        _agent = _build_outer_graph()
+    return _agent
+
+
+# ---- 外层图状态：消息 + 计划 + 当前步 ----
+class PlanState(MessagesState):
+    plan: list[dict]          # [{"step": str, "status": "pending|done|failed"}]
+    final_reply: str          # executor 最后一次回复，作为最终答案
+
+
+def _plan_node(state: PlanState) -> dict:
+    """规划节点：LLM 拆解任务（平凡任务空计划直通 executor）。"""
+    from .planner import make_plan, plan_to_text
+
+    user_msg = state["messages"][-1].content if state["messages"] else ""
+    plan = make_plan(str(user_msg))
+    plan_dicts = [s.model_dump() for s in plan.steps]
+    if plan_dicts:
+        notice = SystemMessage(content=f"任务已拆解为计划，逐项执行：\n{plan_to_text(plan_dicts)}")
+        return {"plan": plan_dicts, "messages": [notice]}
+    return {"plan": []}
+
+
+def _next_pending(plan: list[dict]) -> int | None:
+    """返回第一个 pending 步骤的下标；无则 None。"""
+    for i, s in enumerate(plan):
+        if s.get("status") == "pending":
+            return i
+    return None
+
+
+def _execute_node(state: PlanState, config: RunnableConfig) -> dict:
+    """执行节点：把当前待办步骤（或整条消息，若平凡任务）交给 executor 子图。"""
+    executor = get_executor()
+    plan = state.get("plan") or []
+    idx = _next_pending(plan)
+    if idx is None:
+        task = str(state["messages"][-1].content)
+    else:
+        task = f"执行计划第 {idx + 1} 步：{plan[idx]['step']}\n完成后只汇报这一步的结果。"
+
+    result = executor.invoke({"messages": [("user", task)]}, config)
+    reply = result["messages"][-1].content or ""
+
+    new_plan = [dict(s) for s in plan]
+    if idx is not None:
+        # executor 跑完该步：结果里含拒绝标记视为失败，否则视为完成
+        new_plan[idx]["status"] = "failed" if "[已拒绝]" in reply else "done"
+    # 把 executor 回复作为 AIMessage 并入外层状态：/chat 提取与历史查询都依赖它
+    from langchain_core.messages import AIMessage as _AIM
+
+    return {"plan": new_plan, "final_reply": str(reply), "messages": [_AIM(content=reply)]}
+
+
+def _reflect_node(state: PlanState) -> dict:
+    """反思节点：追加下一步指令或汇总收尾。"""
+    plan = state.get("plan") or []
+    if _next_pending(plan) is not None:
+        return {"messages": [SystemMessage(content="计划还有待办步骤，继续执行下一步。")]}
+    return {"messages": [SystemMessage(
+        content="计划已全部执行完，请基于以上各步结果给用户一个简短的最终总结。")]}
+
+
+def _route_after_reflect(state: PlanState) -> str:
+    """reflect 后路由：有待办 -> 继续执行；无 -> 结束。"""
+    return "executor" if _next_pending(state.get("plan") or []) is not None else END
+
+
+def _build_outer_graph() -> CompiledStateGraph:
+    """组装外层 plan-and-execute 图（executor 为 create_agent 子图）。"""
+    g = StateGraph(PlanState)
+    g.add_node("plan", _plan_node)
+    g.add_node("executor", _execute_node)
+    g.add_node("reflect", _reflect_node)
+    g.add_edge(START, "plan")
+    # plan 后总是进 executor：平凡任务（空计划）由 executor 整体处理一次，
+    # 有计划的任务由 executor 按当前待办步执行
+    g.add_edge("plan", "executor")
+    g.add_edge("executor", "reflect")
+    g.add_conditional_edges("reflect", _route_after_reflect, ["executor", END])
+    return g.compile(checkpointer=checkpointer)
+
+
+def get_executor() -> CompiledStateGraph:
+    """executor 子图（create_agent + 全部工具），惰性构建、进程级复用。"""
+    global _executor
+    if "_executor" not in globals():
+        _executor = create_agent(
             model=_build_model(),
             tools=TOOLS,
             system_prompt=SYSTEM_PROMPT,
-            checkpointer=checkpointer,
-        )
-    return _agent
+        )  # 子图不挂 checkpointer：外层图统一持久化
+    return _executor
 
 
 def get_agent() -> CompiledStateGraph:
