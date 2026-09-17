@@ -47,7 +47,9 @@ def chat(
         console.print("[dim]⏳ 处理中…（多工具任务可能需要 1-2 分钟）[/dim]")
         try:
             for event, data in client.chat_stream(sid, text):
-                if event == "message":
+                if event == "start":
+                    sid = data  # 流一开始就拿到会话 id，审批时不再为空
+                elif event == "message":
                     if not chunks:
                         console.print("[dim]✓ 模型开始回复[/dim]")
                     chunks.append(data)
@@ -75,6 +77,9 @@ def chat(
 
         nonlocal sid
         pa = _json.loads(payload_json)
+        if not sid:
+            console.print("[red]未获取到会话 ID，无法提交审批（请重启 CLI 后重试）[/red]")
+            return
         args_str = _json.dumps(pa["args"], ensure_ascii=False, indent=2)
         console.print(f"[yellow]⛔ 需要审批：{pa['tool']}[/yellow]")
         console.print(Panel(args_str, title=pa.get("question", "操作详情"), border_style="yellow"))

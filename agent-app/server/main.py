@@ -137,6 +137,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
         try:
+            # 先告知 session_id：客户端在首个审批到来前就能拿到 sid
+            yield await sse("start", session_id)
             # compiled graph 原生支持 astream（sync 节点会自动在线程池执行）
             async for chunk in agent.astream(
                 {"messages": [{"role": "user", "content": req.message}]},
