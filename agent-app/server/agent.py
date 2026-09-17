@@ -55,22 +55,54 @@ def search_docs(query: str) -> str:
     return _search(query)
 
 
-# 审批包装：敏感工具执行前 interrupt 暂停，等待人工确认后 resume
+# 审批包装：敏感工具执行前 interrupt 暂停，等待人工确认后 resume。
+# UX 对齐 codex：只读操作自动放行；审批支持「本会话总是允许」（always 缓存）。
 from langgraph.types import interrupt  # noqa: E402
+
+from .tools_system import is_readonly_command  # noqa: E402
+
+# 会话级「总是允许」缓存：thread_id -> {tool_name, ...}
+_always_allowed: dict[str, set[str]] = {}
+
+
+def _session_id() -> str:
+    """在图执行上下文中取当前 thread_id（工具节点运行时由 LangGraph 提供）。"""
+    try:
+        from langgraph.config import get_config
+
+        return (get_config() or {}).get("configurable", {}).get("thread_id", "")
+    except Exception:
+        return ""
 
 
 def _with_approval(t: BaseTool) -> BaseTool:
     @tool(t.name, description=t.description, args_schema=t.args_schema)
     def guarded(**kwargs):
+        sid = _session_id()
+        allowed = _always_allowed.setdefault(sid, set())
+
+        # 1) run_cmd 只读命令自动放行（codex 式：读不烦人）
+        if t.name == "run_cmd" and is_readonly_command(kwargs.get("command", "")):
+            return t.invoke(kwargs)
+
+        # 2) 本会话已选「总是允许」：直接放行
+        if t.name in allowed:
+            return t.invoke(kwargs)
+
+        # 3) 弹审批：decision ∈ approve(本次) / always(本会话总是) / reject
         decision = interrupt({
             "type": "approval",
             "tool": t.name,
             "args": kwargs,
             "question": f"是否允许执行 {t.name}？",
+            "options": ["approve", "always", "reject"],
         })
-        if decision != "approve":
-            return f"[已拒绝] 用户未批准 {t.name} 调用（args={kwargs}）。请勿再尝试该操作，改为询问用户。"
-        return t.invoke(kwargs)
+        if decision == "always":
+            allowed.add(t.name)
+            return t.invoke(kwargs)
+        if decision == "approve":
+            return t.invoke(kwargs)
+        return f"[已拒绝] 用户未批准 {t.name} 调用（args={kwargs}）。请勿再尝试该操作，改为询问用户。"
 
     return guarded
 

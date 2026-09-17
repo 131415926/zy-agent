@@ -67,6 +67,7 @@ def build_chat_model(provider: ProviderConfig | None = None, **overrides):
         base_url=p.base_url or None,
         api_key=p.api_key,
         timeout=overrides.pop("timeout", 120),
+        max_retries=overrides.pop("max_retries", 2),  # 429/网络错误有限重试，避免无限卡住
     )
     kwargs.update(overrides)
     return ChatOpenAI(**kwargs)

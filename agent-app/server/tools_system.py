@@ -24,6 +24,73 @@ DANGEROUS_PATTERNS = (
     ":(){ :|:& };:", "dd if=", "> /dev/sda", "chmod -R 777 /",
 )
 
+# 只读命令白名单：整条命令（含管道/&&各段）都命中才免审批自动放行
+READONLY_COMMANDS = {
+    # 文件浏览/查看
+    "ls", "cat", "head", "tail", "wc", "file", "stat", "tree", "find", "pwd", "echo",
+    # 文本搜索
+    "grep", "rg", "awk", "sed", "cut", "sort", "uniq", "tr", "diff",
+    # 开发工具（只读子命令在 _is_readonly_segment 中进一步校验）
+    "git", "python", "python3", "pip", "pip3", "which", "whoami", "date", "env",
+    "du", "df", "ps", "uname", "hostname", "curl", "wget", "tar", "gzip", "gunzip", "unzip",
+}
+
+# git 只读子命令白名单
+GIT_READONLY_SUBCOMMANDS = {
+    "status", "log", "diff", "show", "branch", "tag", "ls-files", "remote",
+    "blame", "rev-parse", "describe", "shortlog", "ls-remote", "config --get",
+}
+
+# 明确有写操作的命令（即使名字在白名单也不放行）
+WRITE_SUBCOMMANDS = {
+    "pip install", "pip uninstall", "pip3 install", "pip3 uninstall",
+}
+
+
+def _is_readonly_segment(segment: str) -> bool:
+    """判断单个命令段（无管道）是否只读。"""
+    seg = segment.strip()
+    if not seg:
+        return True
+    low = seg.lower()
+    if any(p in low for p in DANGEROUS_PATTERNS):
+        return False
+    # 重定向到文件 = 写操作，不放行（>> 和 > ；2>&1 这类合并流除外）
+    if ">" in seg and ">&" not in seg.replace("2>&1", ""):
+        return False
+    try:
+        parts = shlex.split(seg)
+    except ValueError:
+        return False
+    if not parts:
+        return True
+    cmd = os.path.basename(parts[0].lower())
+    if cmd not in READONLY_COMMANDS:
+        return False
+    rest = " ".join(parts[1:]).lower()
+    # 白名单命令的写型子命令不放行（如 pip install）
+    for w in WRITE_SUBCOMMANDS:
+        w_cmd, w_sub = w.split(" ", 1)
+        if cmd == w_cmd and rest.startswith(w_sub):
+            return False
+    if cmd == "git":
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        return sub in GIT_READONLY_SUBCOMMANDS
+    if cmd in ("python", "python3"):
+        # python -c / 脚本执行有副作用风险，仅放行 --version 类
+        return any(a.startswith("--version") for a in parts[1:])
+    return True
+
+
+def is_readonly_command(command: str) -> bool:
+    """整条命令是否只读：按 | && || ; 切段，全段只读才返回 True。"""
+    import re as _re
+
+    segments = [s for s in _re.split(r"\|\||&&|\||;", command) if s.strip()]
+    if not segments:
+        return False
+    return all(_is_readonly_segment(s) for s in segments)
+
 
 def _safe_path(rel_path: str) -> str:
     """把相对路径解析到沙箱内，越界一律拒绝。"""
@@ -31,7 +98,11 @@ def _safe_path(rel_path: str) -> str:
         raise ValueError(f"路径不合法: {rel_path!r}（请用沙箱内相对路径）")
     full = os.path.abspath(os.path.join(WORKSPACE_ROOT, rel_path))
     if not (full == WORKSPACE_ROOT or full.startswith(WORKSPACE_ROOT + os.sep)):
-        raise ValueError(f"路径越界: {rel_path!r}（只能访问 {WORKSPACE_ROOT} 内的文件）")
+        raise ValueError(
+            f"路径越界: {rel_path!r}。文件工具只能访问工作区沙箱 {WORKSPACE_ROOT} 内的文件。"
+            "若目标是沙箱外的绝对路径（如 ~/Downloads 下的文件），请告知用户当前权限无法直接读取，"
+            "可建议：把文件复制进工作区，或经用户审批后用 run_cmd 访问该路径。"
+        )
     return full
 
 
@@ -57,8 +128,23 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     full = _safe_path(path)
     if not os.path.isfile(full):
         return f"文件不存在: {path}"
-    with open(full, encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+    # 二进制/PDF 等文件直接给出指引，而不是读出一堆乱码
+    try:
+        with open(full, "rb") as f:
+            head = f.read(2048)
+        if b"\x00" in head or head[:4] == b"%PDF":
+            return (
+                f"'{path}' 是二进制文件（PDF/图片等），read_file 无法读取文本。"
+                "如需提取内容，请先经审批执行转换命令（如 python 的 pypdf/marked 解析），"
+                "或让用户直接粘贴文本。"
+            )
+    except OSError as e:
+        return f"读取失败: {e}"
+    try:
+        with open(full, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return f"读取失败: {e}"
     start = max(offset - 1, 0)
     picked = lines[start:start + limit]
     if not picked:

@@ -43,12 +43,12 @@ class AgentClient:
         """
         resp = self._http.post(
             f"{self.base_url}/chat",
-            json={"session_id": session_id, "message": message},
+            json={"session_id": session_id, "message": self._clean(message)},
         )
         return self._check(resp).json()
 
     def approve(self, session_id: str, decision: str = "approve") -> dict:
-        """审批待确认的操作：decision = approve | reject。返回结构与 chat 相同。"""
+        """审批待确认的操作：decision = approve(本次) | always(本会话总是) | reject。"""
         resp = self._http.post(
             f"{self.base_url}/approvals",
             json={"session_id": session_id, "decision": decision},
@@ -60,7 +60,7 @@ class AgentClient:
 
         event ∈ {"message": 文本增量, "tool": 工具调用提示, "done": 会话id, "error": 错误}
         """
-        payload = {"session_id": session_id, "message": message}
+        payload = {"session_id": session_id, "message": self._clean(message)}
         with self._http.stream("POST", f"{self.base_url}/chat/stream", json=payload) as resp:
             if resp.status_code != 200:
                 raise AgentError(f"HTTP {resp.status_code}: {resp.read().decode()}")
@@ -82,6 +82,11 @@ class AgentClient:
         if resp.status_code >= 400:
             raise AgentError(f"HTTP {resp.status_code}: {resp.text}")
         return resp
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        """清洗孤立代理字符（surrogates）：终端粘贴 emoji 常见，不清洗 httpx 编码会崩。"""
+        return text.encode("utf-8", errors="replace").decode("utf-8")
 
     def close(self) -> None:
         self._http.close()

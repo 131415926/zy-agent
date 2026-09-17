@@ -44,13 +44,17 @@ def chat(
         nonlocal sid
         console.print()
         chunks, tools = [], []
+        console.print("[dim]⏳ 处理中…（多工具任务可能需要 1-2 分钟）[/dim]")
         try:
             for event, data in client.chat_stream(sid, text):
                 if event == "message":
+                    if not chunks:
+                        console.print("[dim]✓ 模型开始回复[/dim]")
                     chunks.append(data)
                     print(data, end="", flush=True)
                 elif event == "tool":
                     tools.append(data)
+                    console.print(f"[cyan]🔧 {data}[/cyan]")
                 elif event == "approval":
                     handle_approval(data)
                 elif event == "done":
@@ -71,11 +75,12 @@ def chat(
 
         nonlocal sid
         pa = _json.loads(payload_json)
+        args_str = _json.dumps(pa["args"], ensure_ascii=False, indent=2)
         console.print(f"[yellow]⛔ 需要审批：{pa['tool']}[/yellow]")
-        console.print(Panel(_json.dumps(pa["args"], ensure_ascii=False, indent=2),
-                            title=pa.get("question", "操作详情"), border_style="yellow"))
-        ans = console.input("[yellow]批准执行? [y=允许 / n=拒绝] [/yellow]").strip().lower()
-        decision = "approve" if ans in ("y", "yes") else "reject"
+        console.print(Panel(args_str, title=pa.get("question", "操作详情"), border_style="yellow"))
+        console.print("[dim]  y = 允许本次   a = 本会话总是允许   n = 拒绝[/dim]")
+        ans = console.input("[yellow]你的选择 [y/a/n] [/yellow]").strip().lower()
+        decision = {"a": "always", "y": "approve"}.get(ans, "reject")
         # 审批走同步接口（resume 后继续跑完本轮）
         result = client.approve(sid, decision)
         sid = result.get("session_id", sid)
@@ -110,6 +115,8 @@ def chat(
             sid = None
             console.print("[dim]已开启新会话[/dim]")
             continue
+        # 清洗粘贴内容里的孤立代理字符（macOS 终端复制 emoji 等常见），否则 httpx 编码崩溃
+        text = text.encode("utf-8", errors="replace").decode("utf-8")
         ask(text)
     console.print("[dim]再见！[/dim]")
 

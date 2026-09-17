@@ -109,8 +109,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 @app.post("/approvals", response_model=ChatResponse)
 async def approvals(req: ApprovalRequest) -> ChatResponse:
     """审批接口：approve/reject 后恢复被 interrupt 暂停的图执行。"""
-    if req.decision not in ("approve", "reject"):
-        raise HTTPException(400, "decision 只能为 approve 或 reject")
+    if req.decision not in ("approve", "always", "reject"):
+        raise HTTPException(400, "decision 只能为 approve / always / reject")
     agent = get_agent()
     cfg = _cfg(req.session_id)
     if await _pending_approval(req.session_id) is None:
@@ -194,7 +194,8 @@ def delete_session(session_id: str) -> dict:
     return {"deleted": session_id}
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """CLI 入口：python -m server.main 或根目录 run_server.py。"""
     import argparse
 
     import uvicorn
@@ -207,3 +208,7 @@ if __name__ == "__main__":
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
     uvicorn.run("server.main:app", host=args.host, port=args.port, reload=False)
+
+
+if __name__ == "__main__":
+    main()
