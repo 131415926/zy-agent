@@ -30,6 +30,14 @@ class AgentClient:
     def sessions(self) -> list[str]:
         return self._get("/sessions")["sessions"]
 
+    def traces(self, session_id: str, limit: int = 5) -> dict:
+        """查询会话执行 trace：每次请求的耗时/token/事件序列。"""
+        return self._get(f"/traces/{session_id}?limit={limit}")
+
+    def traces_summary(self, session_id: str) -> dict:
+        """会话级汇总：请求数/总耗时/总 token/事件分布。"""
+        return self._get(f"/traces/{session_id}/summary")
+
     def delete_session(self, session_id: str) -> dict:
         resp = self._http.delete(f"{self.base_url}/sessions/{session_id}")
         return self._check(resp).json()
